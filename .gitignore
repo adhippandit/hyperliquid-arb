@@ -219,4 +219,5 @@ __marimo__/
 
 # Project data files
 gap_log.csv
+gap_log.db
 gap_log_formatted.xlsx

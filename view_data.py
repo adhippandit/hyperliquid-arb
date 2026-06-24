@@ -1,4 +1,4 @@
-import csv
+import sqlite3
 import os
 from openpyxl import Workbook
 from openpyxl.styles import (
@@ -7,7 +7,7 @@ from openpyxl.styles import (
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import get_column_letter
 
-INPUT_FILE  = "gap_log.csv"
+DB_FILE     = "gap_log.db"
 OUTPUT_FILE = "gap_log_formatted.xlsx"
 
 HEADER_BG    = "1E3A5F"   # dark navy
@@ -36,23 +36,26 @@ def make_border():
     return Border(left=thin, right=thin, top=thin, bottom=thin)
 
 def build_excel():
-    if not os.path.exists(INPUT_FILE):
-        print(f"No data file found. Run data_logger.py first to collect data.")
+    if not os.path.exists(DB_FILE):
+        print("No data file found. Run data_logger.py first to collect data.")
         return
 
-    with open(INPUT_FILE, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows   = list(reader)
+    con = sqlite3.connect(DB_FILE)
+    con.row_factory = sqlite3.Row
+    raw  = con.execute("SELECT * FROM gaps ORDER BY id").fetchall()
+    con.close()
 
-    if not rows:
-        print("No data yet in gap_log.csv.")
+    if not raw:
+        print("No data yet in gap_log.db.")
         return
+
+    rows    = [dict(r) for r in raw]
+    headers = [k for k in rows[0].keys() if k != "id"]
+    rows    = [{k: v for k, v in r.items() if k != "id"} for r in rows]
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Gap Log"
-
-    headers = list(rows[0].keys())
 
     # --- Header row ---
     header_fill = PatternFill("solid", fgColor=HEADER_BG)

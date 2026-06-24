@@ -1,5 +1,4 @@
-import csv
-import os
+import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -7,23 +6,8 @@ from zoneinfo import ZoneInfo
 import requests
 import yfinance as yf
 
-def is_market_open():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() >= 5:
-        return False
-    open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_time = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return open_time <= now_et <= close_time
-
-LOG_FILE = "gap_log.csv"
+DB_FILE  = "gap_log.db"
 INTERVAL = 300  # 5 minutes
-
-COLUMNS = [
-    "timestamp", "ticker",
-    "real_price", "hl_price", "gap_usd", "gap_pct",
-    "bid_ask_spread_pct",
-    "hours_to_open", "market_open", "day_of_week", "hour_utc", "vix",
-]
 
 TICKERS = [
     "NVDA", "TSLA", "AAPL", "AMZN", "MSFT",
@@ -33,6 +17,36 @@ TICKERS = [
     "BABA", "MU", "QCOM", "AVGO", "ORCL",
     "NOW", "RIVN",
 ]
+
+def setup_db():
+    con = sqlite3.connect(DB_FILE)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS gaps (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp          TEXT,
+            ticker             TEXT,
+            real_price         REAL,
+            hl_price           REAL,
+            gap_usd            REAL,
+            gap_pct            REAL,
+            bid_ask_spread_pct REAL,
+            hours_to_open      REAL,
+            market_open        INTEGER,
+            day_of_week        TEXT,
+            hour_utc           INTEGER,
+            vix                REAL
+        )
+    """)
+    con.commit()
+    con.close()
+
+def is_market_open():
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() >= 5:
+        return False
+    open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_time = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_time <= now_et <= close_time
 
 def hours_to_market_open():
     now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -85,7 +99,7 @@ def fetch_hl_data():
 
 def log_snapshot():
     now         = datetime.now(timezone.utc)
-    market_open = is_market_open()
+    market_open = 1 if is_market_open() else 0
     h_to_open   = hours_to_market_open()
     vix         = fetch_vix()
     real_prices = fetch_real_prices()
@@ -103,32 +117,37 @@ def log_snapshot():
         gap     = hl_mid - real
         gap_pct = (gap / real) * 100
 
-        rows.append({
-            "timestamp":          now.strftime("%Y-%m-%d %H:%M:%S"),
-            "ticker":             ticker,
-            "real_price":         round(real,    4),
-            "hl_price":           round(hl_mid,  4),
-            "gap_usd":            round(gap,     4),
-            "gap_pct":            round(gap_pct, 4),
-            "bid_ask_spread_pct": hl.get("bid_ask_spread_pct"),
-            "hours_to_open":      h_to_open,
-            "market_open":        market_open,
-            "day_of_week":        now.strftime("%A"),
-            "hour_utc":           now.hour,
-            "vix":                vix,
-        })
+        rows.append((
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            ticker,
+            round(real,    4),
+            round(hl_mid,  4),
+            round(gap,     4),
+            round(gap_pct, 4),
+            hl.get("bid_ask_spread_pct"),
+            h_to_open,
+            market_open,
+            now.strftime("%A"),
+            now.hour,
+            vix,
+        ))
 
-    file_exists = os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(rows)
+    con = sqlite3.connect(DB_FILE)
+    con.executemany("""
+        INSERT INTO gaps (
+            timestamp, ticker, real_price, hl_price,
+            gap_usd, gap_pct, bid_ask_spread_pct,
+            hours_to_open, market_open, day_of_week, hour_utc, vix
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, rows)
+    con.commit()
+    con.close()
 
     return len(rows)
 
 if __name__ == "__main__":
-    print(f"Data logger started — writing to '{LOG_FILE}' every {INTERVAL // 60} minutes.", flush=True)
+    setup_db()
+    print(f"Data logger started — writing to '{DB_FILE}' every {INTERVAL // 60} minutes.", flush=True)
     print("Press Ctrl+C to stop.\n", flush=True)
 
     while True:
