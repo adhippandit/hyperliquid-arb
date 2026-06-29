@@ -221,3 +221,6 @@ __marimo__/
 gap_log.csv
 gap_log.db
 gap_log_formatted.xlsx
+model.pkl
+backtest_results.xlsx
+scorer.html
