@@ -1,13 +1,31 @@
+import sqlite3
 import pandas as pd
 import pickle
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from risk import MIN_CONFIDENCE
-from events import load_data, build_features, build_events, time_split, FEATURES
+from events import load_data, build_features, build_events, time_split, FEATURES, DB_FILE
 
 MODEL_FILE    = "model.pkl"
 POSITION_SIZE = 1000   # dollars per trade
+
+
+def funding_income(con, ticker, direction, entry_time, exit_time, position_size):
+    """
+    Hyperliquid pays funding hourly between longs and shorts (see funding
+    table, backfilled by backfill_funding.py). Positive funding_rate means
+    longs pay shorts; we're short whenever the gap is a premium, which is
+    exactly the side that gets paid — so this is usually a real tailwind,
+    not just noise, but it's summed from the actual recorded rate per hour
+    rather than assumed.
+    """
+    rows = con.execute(
+        "SELECT funding_rate FROM funding WHERE ticker = ? AND timestamp > ? AND timestamp <= ?",
+        (ticker, entry_time.strftime("%Y-%m-%d %H:%M:%S"), exit_time.strftime("%Y-%m-%d %H:%M:%S")),
+    ).fetchall()
+    sign = 1 if direction == "SHORT" else -1
+    return sum(sign * r[0] * position_size for r in rows)
 
 
 def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
@@ -19,13 +37,22 @@ def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
     signals = test_events[test_events["confidence"] >= MIN_CONFIDENCE].copy()
     print(f"  {len(signals):,} of {len(test_events):,} test events meet the {MIN_CONFIDENCE*100:.0f}% confidence threshold", flush=True)
 
+    con = sqlite3.connect(DB_FILE)
+    has_funding_table = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='funding'"
+    ).fetchone() is not None
+
     trades = []
     for _, row in signals.iterrows():
         direction    = "SHORT" if row["gap_pct"] > 0 else "LONG"
         spread       = row["bid_ask_spread_pct"] or 0.1
         gap_captured = row["gap_abs"] - row["exit_gap_abs"]
         spread_cost  = spread * POSITION_SIZE / 100
-        pnl          = round((gap_captured / 100) * POSITION_SIZE - spread_cost, 4)
+        funding      = (
+            funding_income(con, row["ticker"], direction, row["timestamp"], row["exit_time"], POSITION_SIZE)
+            if has_funding_table else 0.0
+        )
+        pnl          = round((gap_captured / 100) * POSITION_SIZE - spread_cost + funding, 4)
         hours_held   = round((row["exit_time"] - row["timestamp"]).total_seconds() / 3600, 1)
 
         trades.append({
@@ -37,11 +64,13 @@ def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
             "exit_gap_pct":  round(row["exit_gap_abs"] if row["gap_pct"] > 0 else -row["exit_gap_abs"], 3),
             "spread_pct":    round(spread, 4),
             "confidence":    f"{row['confidence']*100:.1f}%",
+            "funding_usd":   round(funding, 4),
             "hours_held":    hours_held,
             "outcome":       row["outcome"],
             "pnl_usd":       pnl,
         })
 
+    con.close()
     return pd.DataFrame(trades)
 
 
@@ -50,14 +79,15 @@ def print_summary(trades_df):
         print(f"No trades were generated. Try lowering MIN_CONFIDENCE in risk.py (currently {MIN_CONFIDENCE*100:.0f}%).")
         return
 
-    total      = len(trades_df)
-    wins       = (trades_df["outcome"] == "WIN").sum()
-    losses     = (trades_df["outcome"] == "LOSS").sum()
-    win_rate   = wins / total * 100
-    total_pnl  = trades_df["pnl_usd"].sum()
-    avg_pnl    = trades_df["pnl_usd"].mean()
-    best_trade = trades_df["pnl_usd"].max()
-    worst_trade= trades_df["pnl_usd"].min()
+    total       = len(trades_df)
+    wins        = (trades_df["outcome"] == "WIN").sum()
+    losses      = (trades_df["outcome"] == "LOSS").sum()
+    win_rate    = wins / total * 100
+    total_pnl   = trades_df["pnl_usd"].sum()
+    avg_pnl     = trades_df["pnl_usd"].mean()
+    best_trade  = trades_df["pnl_usd"].max()
+    worst_trade = trades_df["pnl_usd"].min()
+    total_funding = trades_df["funding_usd"].sum()
 
     print("\n" + "="*50)
     print("  BACKTEST RESULTS")
@@ -66,7 +96,7 @@ def print_summary(trades_df):
     print(f"  Total trades:    {total}")
     print(f"  Wins:            {wins}  ({win_rate:.1f}%)")
     print(f"  Losses:          {losses}  ({100-win_rate:.1f}%)")
-    print(f"  Total P&L:       ${total_pnl:+.2f}")
+    print(f"  Total P&L:       ${total_pnl:+.2f}   (of which funding: ${total_funding:+.2f})")
     print(f"  Avg P&L / trade: ${avg_pnl:+.2f}")
     print(f"  Best trade:      ${best_trade:+.2f}")
     print(f"  Worst trade:     ${worst_trade:+.2f}")
@@ -118,7 +148,7 @@ def save_excel(trades_df):
     col_widths = {
         "ticker": 8, "entry_time": 18, "exit_time": 18, "direction": 10,
         "entry_gap_pct": 14, "exit_gap_pct": 13, "spread_pct": 11,
-        "confidence": 12, "hours_held": 12, "outcome": 10, "pnl_usd": 12,
+        "confidence": 12, "funding_usd": 12, "hours_held": 12, "outcome": 10, "pnl_usd": 12,
     }
     for col_idx, col_name in enumerate(headers, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = col_widths.get(col_name, 14)
@@ -128,10 +158,11 @@ def save_excel(trades_df):
 
     # Summary sheet
     ws2 = wb.create_sheet("Summary")
-    total     = len(trades_df)
-    wins      = (trades_df["outcome"] == "WIN").sum()
-    total_pnl = trades_df["pnl_usd"].sum()
-    avg_pnl   = trades_df["pnl_usd"].mean()
+    total         = len(trades_df)
+    wins          = (trades_df["outcome"] == "WIN").sum()
+    total_pnl     = trades_df["pnl_usd"].sum()
+    avg_pnl       = trades_df["pnl_usd"].mean()
+    total_funding = trades_df["funding_usd"].sum()
 
     summary_rows = [
         ("Position size per trade", f"${POSITION_SIZE:,}"),
@@ -140,6 +171,7 @@ def save_excel(trades_df):
         ("Losses",                  total - wins),
         ("Win rate",                f"{wins/total*100:.1f}%"),
         ("Total P&L",               f"${total_pnl:+.2f}"),
+        ("  of which funding",      f"${total_funding:+.2f}"),
         ("Avg P&L per trade",       f"${avg_pnl:+.2f}"),
         ("Best trade",              f"${trades_df['pnl_usd'].max():+.2f}"),
         ("Worst trade",             f"${trades_df['pnl_usd'].min():+.2f}"),

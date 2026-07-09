@@ -37,6 +37,15 @@ def setup_db():
             vix                REAL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS funding (
+            ticker       TEXT,
+            timestamp    TEXT,
+            funding_rate REAL,
+            premium      REAL,
+            PRIMARY KEY (ticker, timestamp)
+        )
+    """)
     con.commit()
     con.close()
 
@@ -77,6 +86,47 @@ def fetch_hl_data():
         except:
             pass
     return hl_prices
+
+def fetch_recent_funding(ticker, hours_back=3):
+    """
+    Hyperliquid settles funding hourly regardless of our 5-minute polling
+    cadence. Pulling the last few hours each cycle (instead of just "now")
+    means a slow cycle or brief downtime doesn't leave a gap in the record.
+    """
+    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = end_ms - hours_back * 3600 * 1000
+    try:
+        resp = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={"type": "fundingHistory", "coin": f"xyz:{ticker}", "startTime": start_ms, "endTime": end_ms},
+            timeout=5,
+        ).json()
+        return resp
+    except Exception:
+        return []
+
+def log_funding():
+    con = sqlite3.connect(DB_FILE)
+    total = 0
+    for ticker in TICKERS:
+        entries = fetch_recent_funding(ticker)
+        rows = [
+            (
+                ticker,
+                datetime.fromtimestamp(e["time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                float(e["fundingRate"]),
+                float(e["premium"]),
+            )
+            for e in entries
+        ]
+        con.executemany(
+            "INSERT OR IGNORE INTO funding (ticker, timestamp, funding_rate, premium) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        total += len(rows)
+    con.commit()
+    con.close()
+    return total
 
 def log_snapshot():
     now         = datetime.now(timezone.utc)
@@ -134,7 +184,8 @@ if __name__ == "__main__":
     while True:
         try:
             count = log_snapshot()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}]  Logged {count} rows", flush=True)
+            funding_count = log_funding()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}]  Logged {count} rows, {funding_count} funding entries", flush=True)
             time.sleep(INTERVAL)
         except KeyboardInterrupt:
             print("\nLogger stopped.", flush=True)

@@ -72,6 +72,25 @@ def fetch_hl_data():
             pass
     return hl_prices
 
+def fetch_funding_rates():
+    """Current hourly funding rate per ticker — the ongoing payment collected
+    (or paid) just for holding a position, separate from the price move."""
+    rates = {}
+    try:
+        meta, ctxs = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={"type": "metaAndAssetCtxs", "dex": "xyz"},
+            timeout=5,
+        ).json()
+        names = [u["name"] for u in meta["universe"]]
+        for ticker in TICKERS:
+            full_name = f"xyz:{ticker}"
+            if full_name in names:
+                rates[ticker] = float(ctxs[names.index(full_name)]["funding"])
+    except Exception:
+        pass
+    return rates
+
 def score_gaps(model):
     now         = datetime.now(timezone.utc)
     market_open = is_market_open()
@@ -87,8 +106,9 @@ def score_gaps(model):
     loss_limit_hit = todays_pnl <= -daily_loss_limit()
     already_open = trade_log.open_tickers()
 
-    real_prices = fetch_real_prices()
-    hl_prices   = fetch_hl_data()
+    real_prices   = fetch_real_prices()
+    hl_prices     = fetch_hl_data()
+    funding_rates = fetch_funding_rates()
 
     results = []
     for ticker in TICKERS:
@@ -128,6 +148,14 @@ def score_gaps(model):
         # this one flag, so the banner and the row can never disagree.
         trade_allowed = confidence_ok and vix_ok and not loss_limit_hit and not already_in_position
 
+        direction = "SHORT" if gap_pct > 0 else "LONG"
+        raw_funding = funding_rates.get(ticker)
+        # Sign-adjusted for our side: positive = we collect it, negative = we pay it.
+        funding_pct_per_hour = (
+            raw_funding * 100 * (1 if direction == "SHORT" else -1)
+            if raw_funding is not None else None
+        )
+
         results.append({
             "ticker":       ticker,
             "real":         real,
@@ -136,6 +164,7 @@ def score_gaps(model):
             "gap_abs":      gap_abs,
             "confidence":   confidence,
             "spread":       spread,
+            "funding_pct_per_hour": funding_pct_per_hour,
             "already_open": already_in_position,
             "trade":        trade_allowed,
             "position":     position_size(confidence) if trade_allowed else 0,
@@ -179,6 +208,12 @@ def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, lo
             row_class     = "row-skip"
             position_html = '<span style="color:#484f58">—</span>'
 
+        if r["funding_pct_per_hour"] is None:
+            funding_html = '<span style="color:#484f58">n/a</span>'
+        else:
+            funding_color = "#3fb950" if r["funding_pct_per_hour"] >= 0 else "#ff6b6b"
+            funding_html  = f'<span style="color:{funding_color}">{r["funding_pct_per_hour"]:+.4f}%/hr</span>'
+
         rows_html += f"""
         <tr class="{row_class}">
             <td class="ticker">{r['ticker']}</td>
@@ -192,6 +227,7 @@ def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, lo
                 </div>
             </td>
             <td>{r['spread']:.3f}%</td>
+            <td>{funding_html}</td>
             <td>{position_html}</td>
             <td>{signal_html}</td>
         </tr>"""
@@ -294,6 +330,7 @@ def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, lo
         <th>Gap %</th>
         <th>Confidence</th>
         <th>Spread</th>
+        <th>Funding</th>
         <th>Position $</th>
         <th>Signal</th>
       </tr>
