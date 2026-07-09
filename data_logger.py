@@ -1,10 +1,10 @@
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 import requests
 import yfinance as yf
+from market_hours import is_market_open, hours_to_market_open
 
 DB_FILE  = "gap_log.db"
 INTERVAL = 300  # 5 minutes
@@ -39,25 +39,6 @@ def setup_db():
     """)
     con.commit()
     con.close()
-
-def is_market_open():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() >= 5:
-        return False
-    open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_time = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return open_time <= now_et <= close_time
-
-def hours_to_market_open():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if is_market_open():
-        return 0.0
-    candidate = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    if now_et >= candidate or now_et.weekday() >= 5:
-        candidate += timedelta(days=1)
-        while candidate.weekday() >= 5:
-            candidate += timedelta(days=1)
-    return round((candidate - now_et).total_seconds() / 3600, 2)
 
 def fetch_vix():
     try:

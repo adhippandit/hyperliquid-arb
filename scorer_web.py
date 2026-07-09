@@ -2,15 +2,20 @@ import pickle
 import requests
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import time
 import webbrowser
 import os
-from risk import position_size, daily_loss_limit, vix_allowed, MAX_OPEN_TRADES, TOTAL_CAPITAL, VIX_CIRCUIT_BREAKER
+import threading
+import http.server
+from market_hours import is_market_open, hours_to_market_open
+from risk import position_size, daily_loss_limit, vix_allowed, MAX_OPEN_TRADES, TOTAL_CAPITAL, VIX_CIRCUIT_BREAKER, MIN_CONFIDENCE
+import trade_log
 
-MODEL_FILE = "model.pkl"
-HTML_FILE  = "scorer.html"
+MODEL_FILE  = "model.pkl"
+HTML_FILE   = "scorer.html"
+SERVER_PORT = 8765
 
 TICKERS = [
     "NVDA", "TSLA", "AAPL", "AMZN", "MSFT",
@@ -21,32 +26,19 @@ TICKERS = [
     "NOW", "RIVN",
 ]
 
-CONFIDENCE_THRESHOLD = 0.70
-
-def is_market_open():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() >= 5:
-        return False
-    open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_time = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return open_time <= now_et <= close_time
-
-def hours_to_market_open():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if is_market_open():
-        return 0.0
-    candidate = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    if now_et >= candidate or now_et.weekday() >= 5:
-        candidate += timedelta(days=1)
-        while candidate.weekday() >= 5:
-            candidate += timedelta(days=1)
-    return round((candidate - now_et).total_seconds() / 3600, 2)
-
 def fetch_vix():
-    try:
-        return round(yf.Ticker("^VIX").fast_info.last_price, 2)
-    except:
-        return 20.0
+    """
+    Fail closed, not open: a risk gate that quietly assumes a calm VIX when
+    the fetch fails defeats its own purpose. Retry briefly, then return None
+    so callers treat "unknown" the same as "unsafe."
+    """
+    for attempt in range(3):
+        try:
+            return round(yf.Ticker("^VIX").fast_info.last_price, 2)
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
+    return None
 
 def fetch_real_prices():
     prices = {}
@@ -89,6 +81,12 @@ def score_gaps(model):
     is_weekend  = 1 if day_num >= 5 else 0
     hour_utc    = now.hour
 
+    # A missing VIX reading is treated as unsafe, not calm — see fetch_vix().
+    vix_ok       = vix is not None and vix_allowed(vix)
+    todays_pnl   = trade_log.daily_pnl()
+    loss_limit_hit = todays_pnl <= -daily_loss_limit()
+    already_open = trade_log.open_tickers()
+
     real_prices = fetch_real_prices()
     hl_prices   = fetch_hl_data()
 
@@ -110,49 +108,72 @@ def score_gaps(model):
 
         spread = hl.get("bid_ask_spread_pct", 0.1)
 
-        features = pd.DataFrame([{
-            "gap_abs":            gap_abs,
-            "is_weekend":         is_weekend,
-            "day_num":            day_num,
-            "hour_utc":           hour_utc,
-            "hours_to_open":      h_to_open,
-            "vix":                vix,
-            "bid_ask_spread_pct": spread,
-        }])
+        if vix is None:
+            confidence = 0.0  # model wasn't trained on a missing VIX; don't score it
+        else:
+            features = pd.DataFrame([{
+                "gap_abs":            gap_abs,
+                "is_weekend":         is_weekend,
+                "day_num":            day_num,
+                "hour_utc":           hour_utc,
+                "hours_to_open":      h_to_open,
+                "vix":                vix,
+                "bid_ask_spread_pct": spread,
+            }])
+            confidence = model.predict_proba(features)[0][1]
 
-        confidence = model.predict_proba(features)[0][1]
+        already_in_position = ticker in already_open
+        confidence_ok = confidence >= MIN_CONFIDENCE
+        # Single source of truth: every reason to not trade funnels through
+        # this one flag, so the banner and the row can never disagree.
+        trade_allowed = confidence_ok and vix_ok and not loss_limit_hit and not already_in_position
 
         results.append({
-            "ticker":     ticker,
-            "real":       real,
-            "hl":         hl_mid,
-            "gap_pct":    gap_pct,
-            "gap_abs":    gap_abs,
-            "confidence": confidence,
-            "spread":     spread,
-            "trade":      confidence >= CONFIDENCE_THRESHOLD,
-            "position":   position_size(confidence) if confidence >= CONFIDENCE_THRESHOLD else 0,
+            "ticker":       ticker,
+            "real":         real,
+            "hl":           hl_mid,
+            "gap_pct":      gap_pct,
+            "gap_abs":      gap_abs,
+            "confidence":   confidence,
+            "spread":       spread,
+            "already_open": already_in_position,
+            "trade":        trade_allowed,
+            "position":     position_size(confidence) if trade_allowed else 0,
         })
 
     results.sort(key=lambda x: x["confidence"], reverse=True)
-    return results, vix, h_to_open, market_open, now
+    return results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit
 
-def write_html(results, vix, h_to_open, market_open, now):
+def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit):
     sg_time = datetime.now(ZoneInfo("Asia/Singapore"))
     market_status = "OPEN" if market_open else "CLOSED"
     market_color  = "#00c853" if market_open else "#ff1744"
-    trades        = [r for r in results if r["trade"]]
+
+    # "trade" already folds in confidence + VIX + loss-limit + already-open
+    # (see score_gaps). MAX_OPEN_TRADES is enforced here, on the same
+    # confidence-sorted list, so the row tag matches what the banner claims.
+    tradeable = [r for r in results if r["trade"]]
+    taken     = {r["ticker"] for r in tradeable[:MAX_OPEN_TRADES]}
 
     rows_html = ""
     for r in results:
         gap_color  = "#ff4444" if r["gap_pct"] > 0 else "#00c853"
-        conf_pct   = f"{r['confidence']*100:.1f}%"
-        conf_bar   = int(r["confidence"] * 100)
+        conf_pct   = f"{r['confidence']*100:.1f}%" if vix is not None else "n/a"
+        conf_bar   = int(r["confidence"] * 100) if vix is not None else 0
 
-        if r["trade"]:
-            signal_html  = '<span class="signal-trade">TRADE IT</span>'
-            row_class    = "row-trade"
+        if r["ticker"] in taken:
+            signal_html   = '<span class="signal-trade">TRADE IT</span>'
+            row_class     = "row-trade"
             position_html = f'<span style="color:#3fb950;font-weight:700">${r["position"]:,.0f}</span>'
+        elif r["already_open"]:
+            signal_html   = '<span class="signal-skip">already open</span>'
+            row_class     = "row-skip"
+            position_html = '<span style="color:#484f58">—</span>'
+        elif r["trade"]:
+            # Passed every check but bumped by the MAX_OPEN_TRADES cap
+            signal_html   = '<span class="signal-skip">limit reached</span>'
+            row_class     = "row-skip"
+            position_html = '<span style="color:#484f58">—</span>'
         else:
             signal_html   = '<span class="signal-skip">skip</span>'
             row_class     = "row-skip"
@@ -175,22 +196,37 @@ def write_html(results, vix, h_to_open, market_open, now):
             <td>{signal_html}</td>
         </tr>"""
 
-    if not vix_allowed(vix):
+    if vix is None:
+        banner = (
+            '<div class="banner-wait" style="border-color:#ff1744;color:#ff6b6b">'
+            '&#9888; VIX UNAVAILABLE — could not fetch a live reading after 3 retries &mdash; '
+            'treating as unsafe, no trades until it recovers</div>'
+        )
+    elif not vix_ok:
         banner = (
             f'<div class="banner-wait" style="border-color:#ff1744;color:#ff6b6b">'
             f'&#9888; VIX CIRCUIT BREAKER ACTIVE — VIX is {vix} (limit: {VIX_CIRCUIT_BREAKER}) &mdash; '
             f'Market too volatile, no trades today regardless of signals</div>'
         )
-    elif trades:
-        capped   = trades[:MAX_OPEN_TRADES]
-        exposure = sum(r["position"] for r in capped)
+    elif loss_limit_hit:
+        banner = (
+            f'<div class="banner-wait" style="border-color:#ff1744;color:#ff6b6b">'
+            f'&#9888; DAILY LOSS LIMIT HIT — today\'s realized P&amp;L is ${todays_pnl:+.2f} '
+            f'(limit: -${daily_loss_limit():,.0f}) &mdash; no more trades today</div>'
+        )
+    elif taken:
+        exposure = sum(r["position"] for r in tradeable[:MAX_OPEN_TRADES])
         banner   = (
-            f'<div class="banner-trade">&#9650; {len(trades)} trade signal{"s" if len(trades)>1 else ""} above {int(CONFIDENCE_THRESHOLD*100)}% confidence'
-            f' &nbsp;&bull;&nbsp; Taking top {len(capped)} (max {MAX_OPEN_TRADES}) &nbsp;&bull;&nbsp; Total exposure: ${exposure:,.0f} of ${TOTAL_CAPITAL:,}'
-            f' &nbsp;&bull;&nbsp; Daily loss limit: ${daily_loss_limit():,.0f}</div>'
+            f'<div class="banner-trade">&#9650; {len(tradeable)} trade signal{"s" if len(tradeable)>1 else ""} above {int(MIN_CONFIDENCE*100)}% confidence'
+            f' &nbsp;&bull;&nbsp; Taking top {len(taken)} (max {MAX_OPEN_TRADES}) &nbsp;&bull;&nbsp; Total exposure: ${exposure:,.0f} of ${TOTAL_CAPITAL:,}'
+            f' &nbsp;&bull;&nbsp; Today\'s P&amp;L: ${todays_pnl:+.2f} &nbsp;&bull;&nbsp; Daily loss limit: ${daily_loss_limit():,.0f}</div>'
         )
     else:
-        banner = f'<div class="banner-wait">No high-confidence opportunities right now &mdash; waiting for next refresh &nbsp;&bull;&nbsp; Daily loss limit: ${daily_loss_limit():,.0f}</div>'
+        banner = (
+            f'No high-confidence opportunities right now &mdash; waiting for next refresh '
+            f'&nbsp;&bull;&nbsp; Today\'s P&amp;L: ${todays_pnl:+.2f} &nbsp;&bull;&nbsp; Daily loss limit: ${daily_loss_limit():,.0f}'
+        )
+        banner = f'<div class="banner-wait">{banner}</div>'
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -284,24 +320,35 @@ def banner_css():
         " padding:12px 20px; margin-bottom:20px; color:#8b949e; font-size:14px; }\n"
     )
 
+def start_server():
+    os.chdir(os.path.dirname(os.path.abspath(HTML_FILE)) or ".")
+    handler = http.server.SimpleHTTPRequestHandler
+    handler.log_message = lambda *a: None  # silence request logs
+    server = http.server.HTTPServer(("localhost", SERVER_PORT), handler)
+    server.serve_forever()
+
 def main():
     print("Loading model...", flush=True)
     with open(MODEL_FILE, "rb") as f:
         model = pickle.load(f)
     print("Model ready.", flush=True)
 
+    t = threading.Thread(target=start_server, daemon=True)
+    t.start()
+    print(f"Serving on http://localhost:{SERVER_PORT}/{HTML_FILE}", flush=True)
+
     first_run = True
     while True:
         try:
             print(f"[{datetime.now().strftime('%H:%M:%S')}]  Fetching prices...", flush=True)
-            results, vix, h_to_open, market_open, now = score_gaps(model)
-            write_html(results, vix, h_to_open, market_open, now)
+            results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit = score_gaps(model)
+            write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit)
 
             trades = [r for r in results if r["trade"]]
-            print(f"[{datetime.now().strftime('%H:%M:%S')}]  {len(results)} gaps scored — {len(trades)} trade signals — saved to scorer.html", flush=True)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}]  {len(results)} gaps scored — {len(trades)} trade signals", flush=True)
 
             if first_run:
-                webbrowser.open(f"file:///{os.path.abspath(HTML_FILE)}")
+                webbrowser.open(f"http://localhost:{SERVER_PORT}/{HTML_FILE}")
                 first_run = False
 
             time.sleep(300)

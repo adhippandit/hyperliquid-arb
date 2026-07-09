@@ -1,119 +1,53 @@
-import sqlite3
 import pandas as pd
 import pickle
-from datetime import timedelta
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from risk import MIN_CONFIDENCE
+from events import load_data, build_features, build_events, time_split, FEATURES
 
-DB_FILE    = "gap_log.db"
-MODEL_FILE = "model.pkl"
+MODEL_FILE    = "model.pkl"
+POSITION_SIZE = 1000   # dollars per trade
 
-CONFIDENCE_THRESHOLD = 0.70
-CLOSE_THRESHOLD      = 0.30   # gap_pct below this = closed
-HORIZON_HOURS        = 48     # max hours we hold a trade
-POSITION_SIZE        = 1000   # dollars per trade
 
-DAY_MAP = {
-    "Monday": 0, "Tuesday": 1, "Wednesday": 2,
-    "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6
-}
+def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
+    test_events = test_events.dropna(subset=FEATURES).copy()
+    test_events["confidence"] = model.predict_proba(test_events[FEATURES])[:, 1]
 
-def load_data():
-    con = sqlite3.connect(DB_FILE)
-    df  = pd.read_sql("SELECT * FROM gaps ORDER BY id", con)
-    con.close()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df
-
-def split_data(df):
-    # Use the last 20% of time as the holdout — data the model never trained on
-    cutoff = df["timestamp"].quantile(0.80)
-    train  = df[df["timestamp"] <= cutoff]
-    test   = df[df["timestamp"] >  cutoff]
-    print(f"  Training period: {train['timestamp'].min().strftime('%a %d %b %H:%M')} → {train['timestamp'].max().strftime('%a %d %b %H:%M')}", flush=True)
-    print(f"  Test period:     {test['timestamp'].min().strftime('%a %d %b %H:%M')} → {test['timestamp'].max().strftime('%a %d %b %H:%M')}", flush=True)
-    print(f"  Test rows:       {len(test):,}", flush=True)
-    return test
-
-def build_features(df):
-    df = df.copy()
-    df["day_num"]    = df["day_of_week"].map(DAY_MAP)
-    df["is_weekend"] = df["day_num"].isin([5, 6]).astype(int)
-    df["gap_abs"]    = df["gap_pct"].abs()
-    return df
-
-FEATURES = [
-    "gap_abs", "is_weekend", "day_num", "hour_utc",
-    "hours_to_open", "vix", "bid_ask_spread_pct",
-]
-
-def run_backtest(df, model):
-    df = build_features(df)
-    df = df.dropna(subset=FEATURES)
-
-    # Score all rows at once — much faster than one at a time
-    df["confidence"] = model.predict_proba(df[FEATURES])[:, 1]
-
-    # Keep only rows that would trigger a trade signal
-    signals = df[(df["gap_abs"] >= 0.5) & (df["confidence"] >= CONFIDENCE_THRESHOLD)].copy()
-    print(f"  {len(signals):,} trade signals found", flush=True)
+    # Each row here is already one distinct gap event (see events.py) — no
+    # need to dedupe further, unlike the old row-per-5-minutes version.
+    signals = test_events[test_events["confidence"] >= MIN_CONFIDENCE].copy()
+    print(f"  {len(signals):,} of {len(test_events):,} test events meet the {MIN_CONFIDENCE*100:.0f}% confidence threshold", flush=True)
 
     trades = []
+    for _, row in signals.iterrows():
+        direction    = "SHORT" if row["gap_pct"] > 0 else "LONG"
+        spread       = row["bid_ask_spread_pct"] or 0.1
+        gap_captured = row["gap_abs"] - row["exit_gap_abs"]
+        spread_cost  = spread * POSITION_SIZE / 100
+        pnl          = round((gap_captured / 100) * POSITION_SIZE - spread_cost, 4)
+        hours_held   = round((row["exit_time"] - row["timestamp"]).total_seconds() / 3600, 1)
 
-    for ticker in signals["ticker"].unique():
-        tkr_all = df[df["ticker"] == ticker].copy()
-        sig     = signals[signals["ticker"] == ticker]
-
-        for _, row in sig.iterrows():
-            entry_time    = row["timestamp"]
-            entry_gap_pct = row["gap_pct"]
-            entry_gap_abs = row["gap_abs"]
-            spread        = row["bid_ask_spread_pct"] or 0.1
-            confidence    = row["confidence"]
-            direction     = "SHORT" if entry_gap_pct > 0 else "LONG"
-
-            deadline = entry_time + timedelta(hours=HORIZON_HOURS)
-            future   = tkr_all[(tkr_all["timestamp"] > entry_time) & (tkr_all["timestamp"] <= deadline)]
-
-            if future.empty:
-                continue
-
-            closed_rows = future[future["gap_abs"] < CLOSE_THRESHOLD]
-            if not closed_rows.empty:
-                exit_row     = closed_rows.iloc[0]
-                outcome      = "WIN"
-            else:
-                exit_row     = future.iloc[-1]
-                outcome      = "LOSS"
-
-            exit_time    = exit_row["timestamp"]
-            exit_gap_abs = exit_row["gap_abs"]
-
-            gap_captured = entry_gap_abs - exit_gap_abs
-            spread_cost  = spread * POSITION_SIZE / 100
-            pnl          = round((gap_captured / 100) * POSITION_SIZE - spread_cost, 4)
-            hours_held   = round((exit_time - entry_time).total_seconds() / 3600, 1)
-
-            trades.append({
-                "ticker":        ticker,
-                "entry_time":    entry_time.strftime("%Y-%m-%d %H:%M"),
-                "exit_time":     exit_time.strftime("%Y-%m-%d %H:%M"),
-                "direction":     direction,
-                "entry_gap_pct": round(entry_gap_pct, 3),
-                "exit_gap_pct":  round(exit_gap_abs if entry_gap_pct > 0 else -exit_gap_abs, 3),
-                "spread_pct":    round(spread, 4),
-                "confidence":    f"{confidence*100:.1f}%",
-                "hours_held":    hours_held,
-                "outcome":       outcome,
-                "pnl_usd":       pnl,
-            })
+        trades.append({
+            "ticker":        row["ticker"],
+            "entry_time":    row["timestamp"].strftime("%Y-%m-%d %H:%M"),
+            "exit_time":     row["exit_time"].strftime("%Y-%m-%d %H:%M"),
+            "direction":     direction,
+            "entry_gap_pct": round(row["gap_pct"], 3),
+            "exit_gap_pct":  round(row["exit_gap_abs"] if row["gap_pct"] > 0 else -row["exit_gap_abs"], 3),
+            "spread_pct":    round(spread, 4),
+            "confidence":    f"{row['confidence']*100:.1f}%",
+            "hours_held":    hours_held,
+            "outcome":       row["outcome"],
+            "pnl_usd":       pnl,
+        })
 
     return pd.DataFrame(trades)
 
+
 def print_summary(trades_df):
     if trades_df.empty:
-        print("No trades were generated. Try lowering CONFIDENCE_THRESHOLD.")
+        print(f"No trades were generated. Try lowering MIN_CONFIDENCE in risk.py (currently {MIN_CONFIDENCE*100:.0f}%).")
         return
 
     total      = len(trades_df)
@@ -138,6 +72,7 @@ def print_summary(trades_df):
     print(f"  Worst trade:     ${worst_trade:+.2f}")
     print("="*50)
     print()
+
 
 def save_excel(trades_df):
     OUTPUT = "backtest_results.xlsx"
@@ -220,20 +155,28 @@ def save_excel(trades_df):
     print(f"  Full trade log saved to '{OUTPUT}'")
     print("  Open that file in Excel to see every trade.\n")
 
+
 if __name__ == "__main__":
     print("Loading data...", flush=True)
     df = load_data()
     print(f"  {len(df):,} rows loaded", flush=True)
 
-    print("Splitting into train/test by time...", flush=True)
-    test_df = split_data(df)
+    df = build_features(df)
+
+    print("Collapsing into distinct gap events...", flush=True)
+    events = build_events(df)
+    print(f"  {len(events):,} distinct events", flush=True)
+
+    print("Splitting by time (same cutoff model.py used for training)...", flush=True)
+    train_events, test_events = time_split(events)
+    print(f"  Train events: {len(train_events):,}  |  Test events: {len(test_events):,} (never trained on)", flush=True)
 
     print("Loading model...", flush=True)
     with open(MODEL_FILE, "rb") as f:
         model = pickle.load(f)
 
-    print("Running backtest on unseen test data only...", flush=True)
-    trades_df = run_backtest(test_df, model)
+    print("Running backtest on unseen test events only...", flush=True)
+    trades_df = run_backtest(test_events, model)
 
     print_summary(trades_df)
     save_excel(trades_df)

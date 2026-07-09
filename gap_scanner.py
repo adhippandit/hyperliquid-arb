@@ -6,7 +6,7 @@ import requests
 import yfinance as yf
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from market_hours import is_market_open
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -45,14 +45,6 @@ STOCKS = {
     "NOW":   "ServiceNow      | enterprise workflow automation",
     "RIVN":  "Rivian          | electric truck startup",
 }
-
-def is_market_open():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() >= 5:
-        return False
-    open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_time = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return open_time <= now_et <= close_time
 
 def get_hyperliquid_price(ticker):
     try:
@@ -172,6 +164,10 @@ def render(data, countdown):
     console.print(
         f"  [dim]{len(opps)} opportunities above 1% threshold  |  "
         f"Refreshing in [bold]{countdown}s[/bold]  |  Ctrl+C to quit[/dim]"
+    )
+    console.print(
+        "  [dim italic]Monitor only — raw 1% threshold, no model confidence or risk checks. "
+        "Use scorer_web.py before trading.[/dim italic]"
     )
 
 REFRESH = 30
