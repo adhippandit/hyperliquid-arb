@@ -10,12 +10,14 @@ first crosses the signal threshold, fixes both at the source.
 """
 import sqlite3
 import pandas as pd
+from risk import STOP_LOSS_MULTIPLIER
 
 DB_FILE = "gap_log.db"
 
 SIGNAL_THRESHOLD = 0.5    # gap_pct below this is too small to bother with
 CLOSE_THRESHOLD  = 0.30   # gap_pct below this = considered closed
 HORIZON_HOURS    = 48     # max hours we'd hold a trade
+SANITY_LIMIT     = 20.0   # gap_pct above this almost certainly means a bad price read, not a real weekend dislocation
 
 DAY_MAP = {
     "Monday": 0, "Tuesday": 1, "Wednesday": 2,
@@ -50,9 +52,17 @@ def build_events(df: pd.DataFrame) -> pd.DataFrame:
     SIGNAL_THRESHOLD after having been below it. Each event also carries
     when/how it resolved (label, exit_time, exit_gap_abs, outcome), computed
     once here so model.py and backtest.py can't compute it two different ways.
+
+    Exit is whichever of these happens first:
+      - the gap closes below CLOSE_THRESHOLD (WIN)
+      - the gap widens to STOP_LOSS_MULTIPLIER x the entry size (STOPPED_OUT) —
+        a real stop-loss, not just a formula that exists but never runs
+      - HORIZON_HOURS passes with neither happening (TIMEOUT)
+    Both STOPPED_OUT and TIMEOUT are non-wins (label 0); a capped loss is
+    still a loss for training purposes, it's just a smaller one for P&L.
     """
     df = df.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
-    df["signal_eligible"] = df["gap_abs"] >= SIGNAL_THRESHOLD
+    df["signal_eligible"] = (df["gap_abs"] >= SIGNAL_THRESHOLD) & (df["gap_abs"] <= SANITY_LIMIT)
 
     events = []
     for ticker, g in df.groupby("ticker"):
@@ -71,11 +81,23 @@ def build_events(df: pd.DataFrame) -> pd.DataFrame:
             if future.empty:
                 continue  # not enough future data to know what happened — drop, don't guess
 
-            closed = future[future["gap_abs"] < CLOSE_THRESHOLD]
+            stop_level = row["gap_abs"] * STOP_LOSS_MULTIPLIER
+            closed  = future[future["gap_abs"] < CLOSE_THRESHOLD]
+            stopped = future[future["gap_abs"] >= stop_level]
+
+            candidates = []
             if not closed.empty:
-                exit_row, label, outcome = closed.iloc[0], 1, "WIN"
+                candidates.append((closed.iloc[0]["timestamp"], closed.iloc[0], 1, "WIN"))
+            if not stopped.empty:
+                candidates.append((stopped.iloc[0]["timestamp"], stopped.iloc[0], 0, "STOPPED_OUT"))
+
+            if candidates:
+                # whichever happens first in time wins — you don't get to wait
+                # for the close if the stop-loss triggered hours earlier
+                candidates.sort(key=lambda c: c[0])
+                _, exit_row, label, outcome = candidates[0]
             else:
-                exit_row, label, outcome = future.iloc[-1], 0, "LOSS"
+                exit_row, label, outcome = future.iloc[-1], 0, "TIMEOUT"
 
             event = row.to_dict()
             event["label"]        = label

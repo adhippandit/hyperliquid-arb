@@ -4,11 +4,28 @@ import pickle
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from risk import MIN_CONFIDENCE
+from risk import MIN_CONFIDENCE, MAX_OPEN_TRADES, position_size
 from events import load_data, build_features, build_events, time_split, FEATURES, DB_FILE
 
-MODEL_FILE    = "model.pkl"
-POSITION_SIZE = 1000   # dollars per trade
+MODEL_FILE = "model.pkl"
+
+
+def apply_exposure_cap(signals: pd.DataFrame, max_open: int = MAX_OPEN_TRADES) -> pd.DataFrame:
+    """
+    Simulate the MAX_OPEN_TRADES limit for real, in time order — the backtest
+    previously took every qualifying signal regardless of how many other
+    trades were already open at that moment, which never actually tested the
+    portfolio-level cap the live tool enforces.
+    """
+    signals = signals.sort_values("timestamp")
+    open_exits = []
+    accepted_idx = []
+    for idx, row in signals.iterrows():
+        open_exits = [t for t in open_exits if t > row["timestamp"]]
+        if len(open_exits) < max_open:
+            accepted_idx.append(idx)
+            open_exits.append(row["exit_time"])
+    return signals.loc[accepted_idx]
 
 
 def funding_income(con, ticker, direction, entry_time, exit_time, position_size):
@@ -37,6 +54,9 @@ def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
     signals = test_events[test_events["confidence"] >= MIN_CONFIDENCE].copy()
     print(f"  {len(signals):,} of {len(test_events):,} test events meet the {MIN_CONFIDENCE*100:.0f}% confidence threshold", flush=True)
 
+    signals = apply_exposure_cap(signals)
+    print(f"  {len(signals):,} of those fit within the {MAX_OPEN_TRADES}-concurrent-position cap", flush=True)
+
     con = sqlite3.connect(DB_FILE)
     has_funding_table = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='funding'"
@@ -44,15 +64,16 @@ def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
 
     trades = []
     for _, row in signals.iterrows():
-        direction    = "SHORT" if row["gap_pct"] > 0 else "LONG"
-        spread       = row["bid_ask_spread_pct"] or 0.1
+        direction   = "SHORT" if row["gap_pct"] > 0 else "LONG"
+        spread      = row["bid_ask_spread_pct"] or 0.1
+        pos_size    = position_size(row["confidence"])  # real 5-10% confidence-scaled sizing, not a flat amount
         gap_captured = row["gap_abs"] - row["exit_gap_abs"]
-        spread_cost  = spread * POSITION_SIZE / 100
+        spread_cost  = spread * pos_size / 100
         funding      = (
-            funding_income(con, row["ticker"], direction, row["timestamp"], row["exit_time"], POSITION_SIZE)
+            funding_income(con, row["ticker"], direction, row["timestamp"], row["exit_time"], pos_size)
             if has_funding_table else 0.0
         )
-        pnl          = round((gap_captured / 100) * POSITION_SIZE - spread_cost + funding, 4)
+        pnl          = round((gap_captured / 100) * pos_size - spread_cost + funding, 4)
         hours_held   = round((row["exit_time"] - row["timestamp"]).total_seconds() / 3600, 1)
 
         trades.append({
@@ -64,6 +85,7 @@ def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
             "exit_gap_pct":  round(row["exit_gap_abs"] if row["gap_pct"] > 0 else -row["exit_gap_abs"], 3),
             "spread_pct":    round(spread, 4),
             "confidence":    f"{row['confidence']*100:.1f}%",
+            "position_usd":  round(pos_size, 2),
             "funding_usd":   round(funding, 4),
             "hours_held":    hours_held,
             "outcome":       row["outcome"],
@@ -81,7 +103,9 @@ def print_summary(trades_df):
 
     total       = len(trades_df)
     wins        = (trades_df["outcome"] == "WIN").sum()
-    losses      = (trades_df["outcome"] == "LOSS").sum()
+    stopped_out = (trades_df["outcome"] == "STOPPED_OUT").sum()
+    timed_out   = (trades_df["outcome"] == "TIMEOUT").sum()
+    losses      = stopped_out + timed_out
     win_rate    = wins / total * 100
     total_pnl   = trades_df["pnl_usd"].sum()
     avg_pnl     = trades_df["pnl_usd"].mean()
@@ -89,13 +113,15 @@ def print_summary(trades_df):
     worst_trade = trades_df["pnl_usd"].min()
     total_funding = trades_df["funding_usd"].sum()
 
+    avg_position = trades_df["position_usd"].mean()
+
     print("\n" + "="*50)
     print("  BACKTEST RESULTS")
     print("="*50)
-    print(f"  Position size:   ${POSITION_SIZE:,} per trade")
-    print(f"  Total trades:    {total}")
+    print(f"  Avg position:    ${avg_position:,.0f} per trade (confidence-scaled, was flat $1,000)")
+    print(f"  Total trades:    {total}  (after {MAX_OPEN_TRADES}-concurrent-position cap)")
     print(f"  Wins:            {wins}  ({win_rate:.1f}%)")
-    print(f"  Losses:          {losses}  ({100-win_rate:.1f}%)")
+    print(f"  Losses:          {losses}  ({100-win_rate:.1f}%)  [{stopped_out} stopped out, {timed_out} timed out]")
     print(f"  Total P&L:       ${total_pnl:+.2f}   (of which funding: ${total_funding:+.2f})")
     print(f"  Avg P&L / trade: ${avg_pnl:+.2f}")
     print(f"  Best trade:      ${best_trade:+.2f}")
@@ -148,7 +174,8 @@ def save_excel(trades_df):
     col_widths = {
         "ticker": 8, "entry_time": 18, "exit_time": 18, "direction": 10,
         "entry_gap_pct": 14, "exit_gap_pct": 13, "spread_pct": 11,
-        "confidence": 12, "funding_usd": 12, "hours_held": 12, "outcome": 10, "pnl_usd": 12,
+        "confidence": 12, "position_usd": 12, "funding_usd": 12, "hours_held": 12,
+        "outcome": 12, "pnl_usd": 12,
     }
     for col_idx, col_name in enumerate(headers, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = col_widths.get(col_name, 14)
@@ -165,7 +192,7 @@ def save_excel(trades_df):
     total_funding = trades_df["funding_usd"].sum()
 
     summary_rows = [
-        ("Position size per trade", f"${POSITION_SIZE:,}"),
+        ("Avg position size",       f"${trades_df['position_usd'].mean():,.0f}  (confidence-scaled)"),
         ("Total trades",            total),
         ("Wins",                    wins),
         ("Losses",                  total - wins),

@@ -89,6 +89,19 @@ def open_tickers() -> set:
     return {r[0] for r in rows}
 
 
+def open_positions() -> list:
+    """Full details of open trades, for live stop-loss monitoring."""
+    con = _connect()
+    rows = con.execute(
+        "SELECT ticker, direction, position_usd, entry_gap_pct FROM trades WHERE status = 'open'"
+    ).fetchall()
+    con.close()
+    return [
+        {"ticker": r[0], "direction": r[1], "position_usd": r[2], "entry_gap_pct": r[3]}
+        for r in rows
+    ]
+
+
 def daily_pnl(date: str | None = None) -> float:
     """Realized P&L (dollars) from trades closed today (UTC date)."""
     date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")

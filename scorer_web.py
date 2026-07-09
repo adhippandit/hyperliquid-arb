@@ -10,7 +10,7 @@ import os
 import threading
 import http.server
 from market_hours import is_market_open, hours_to_market_open
-from risk import position_size, daily_loss_limit, vix_allowed, MAX_OPEN_TRADES, TOTAL_CAPITAL, VIX_CIRCUIT_BREAKER, MIN_CONFIDENCE
+from risk import position_size, daily_loss_limit, vix_allowed, MAX_OPEN_TRADES, TOTAL_CAPITAL, VIX_CIRCUIT_BREAKER, MIN_CONFIDENCE, STOP_LOSS_MULTIPLIER
 import trade_log
 
 MODEL_FILE  = "model.pkl"
@@ -91,6 +91,29 @@ def fetch_funding_rates():
         pass
     return rates
 
+def check_stop_losses(real_prices, hl_prices):
+    """
+    A stop-loss formula existing in risk.py never running was a real gap —
+    this is the part that actually watches open positions and flags one the
+    moment its gap has widened to STOP_LOSS_MULTIPLIER x where it was entered.
+    """
+    alerts = []
+    for pos in trade_log.open_positions():
+        ticker = pos["ticker"]
+        real   = real_prices.get(ticker)
+        hl_mid = hl_prices.get(ticker, {}).get("mid")
+        if not real or not hl_mid:
+            continue
+        current_gap_abs = abs((hl_mid - real) / real * 100)
+        stop_level = abs(pos["entry_gap_pct"]) * STOP_LOSS_MULTIPLIER
+        if current_gap_abs >= stop_level:
+            alerts.append({
+                "ticker": ticker, "direction": pos["direction"],
+                "entry_gap_pct": pos["entry_gap_pct"], "current_gap_abs": current_gap_abs,
+                "stop_level": stop_level,
+            })
+    return alerts
+
 def score_gaps(model):
     now         = datetime.now(timezone.utc)
     market_open = is_market_open()
@@ -109,6 +132,7 @@ def score_gaps(model):
     real_prices   = fetch_real_prices()
     hl_prices     = fetch_hl_data()
     funding_rates = fetch_funding_rates()
+    stop_alerts   = check_stop_losses(real_prices, hl_prices)
 
     results = []
     for ticker in TICKERS:
@@ -171,9 +195,9 @@ def score_gaps(model):
         })
 
     results.sort(key=lambda x: x["confidence"], reverse=True)
-    return results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit
+    return results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts
 
-def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit):
+def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts):
     sg_time = datetime.now(ZoneInfo("Asia/Singapore"))
     market_status = "OPEN" if market_open else "CLOSED"
     market_color  = "#00c853" if market_open else "#ff1744"
@@ -231,6 +255,19 @@ def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, lo
             <td>{position_html}</td>
             <td>{signal_html}</td>
         </tr>"""
+
+    stop_alert_html = ""
+    if stop_alerts:
+        rows = "".join(
+            f'<div>&#9888; <b>{a["ticker"]} {a["direction"]}</b> — entered at {a["entry_gap_pct"]:+.2f}% gap, '
+            f'now at {a["current_gap_abs"]:.2f}% (stop level: {a["stop_level"]:.2f}%) — consider closing this position</div>'
+            for a in stop_alerts
+        )
+        stop_alert_html = (
+            f'<div class="banner-wait" style="border-color:#ff1744;color:#ff6b6b;margin-bottom:12px">'
+            f'<b>STOP-LOSS ALERT</b> — {len(stop_alerts)} open position(s) have moved against you past the stop level:'
+            f'{rows}</div>'
+        )
 
     if vix is None:
         banner = (
@@ -319,6 +356,7 @@ def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, lo
 </div>
 
 <div class="container">
+  {stop_alert_html}
   {banner}
 
   <table>
@@ -378,8 +416,8 @@ def main():
     while True:
         try:
             print(f"[{datetime.now().strftime('%H:%M:%S')}]  Fetching prices...", flush=True)
-            results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit = score_gaps(model)
-            write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit)
+            results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts = score_gaps(model)
+            write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts)
 
             trades = [r for r in results if r["trade"]]
             print(f"[{datetime.now().strftime('%H:%M:%S')}]  {len(results)} gaps scored — {len(trades)} trade signals", flush=True)
