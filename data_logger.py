@@ -185,7 +185,7 @@ if __name__ == "__main__":
         try:
             count = log_snapshot()
             funding_count = log_funding()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}]  Logged {count} rows, {funding_count} funding entries", flush=True)
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]  Logged {count} rows, {funding_count} funding entries", flush=True)
             time.sleep(INTERVAL)
         except KeyboardInterrupt:
             print("\nLogger stopped.", flush=True)

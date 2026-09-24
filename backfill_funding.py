@@ -37,16 +37,28 @@ def setup_table(con):
 
 
 def fetch_funding_history(ticker, start_ms, end_ms):
-    resp = requests.post(
-        "https://api.hyperliquid.xyz/info",
-        json={"type": "fundingHistory", "coin": f"xyz:{ticker}", "startTime": start_ms, "endTime": end_ms},
-        timeout=15,
-    ).json()
-    return resp
+    """
+    The API caps each response (~500 entries), which is less than the full
+    history once the window passes ~3 weeks of hourly funding — so page
+    forward from the last entry's time until the window is covered.
+    """
+    entries = []
+    while start_ms < end_ms:
+        page = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={"type": "fundingHistory", "coin": f"xyz:{ticker}", "startTime": start_ms, "endTime": end_ms},
+            timeout=15,
+        ).json()
+        if not page:
+            break
+        entries.extend(page)
+        start_ms = page[-1]["time"] + 1
+        time.sleep(0.2)  # be polite to the API
+    return entries
 
 
 def backfill():
-    con = sqlite3.connect(DB_FILE)
+    con = sqlite3.connect(DB_FILE, timeout=30)  # live logger may hold a write lock briefly
     setup_table(con)
 
     earliest = con.execute("SELECT MIN(timestamp) FROM gaps").fetchone()[0]
@@ -87,7 +99,7 @@ def backfill():
         total += len(rows)
         time.sleep(0.2)  # be polite to the API
 
-    print(f"\nDone. {total} funding rows backfilled into gap_log.db.")
+    print(f"\nDone. {total} funding entries fetched; new ones inserted into gap_log.db (duplicates ignored).")
     con.close()
 
 
