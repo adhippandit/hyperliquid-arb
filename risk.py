@@ -6,6 +6,7 @@ MIN_CONFIDENCE       = 0.70     # minimum model confidence to trade
 MAX_OPEN_TRADES      = 5        # never hold more than 5 positions at once
 STOP_LOSS_MULTIPLIER = 2.0      # exit if gap doubles from entry (e.g. 2% gap → exit at 4%)
 VIX_CIRCUIT_BREAKER  = 30.0     # do not trade at all if VIX is above this level
+TAKER_FEE_PCT        = 0.090    # % per side — Hyperliquid's HIP-3 equity-perp taker rate (2x the standard 0.045%)
 # ────────────────────────────────────────────────────────────────────────────
 
 

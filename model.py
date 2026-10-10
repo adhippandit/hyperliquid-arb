@@ -34,6 +34,7 @@ def train():
         min_samples_leaf=10,
         random_state=42,
         n_jobs=-1,
+        class_weight="balanced",
     )
     model.fit(X_train, y_train)
 

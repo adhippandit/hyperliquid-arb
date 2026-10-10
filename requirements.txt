@@ -1,0 +1,11 @@
+# Third-party dependencies for this project (stdlib modules like sqlite3,
+# datetime, zoneinfo not listed). Pinned to versions verified working on the
+# source machine (Python 3.13.14, Windows 11).
+
+requests==2.34.2
+yfinance==1.4.1
+tzdata==2026.2          # zoneinfo has no timezone db on Windows without this
+pandas==3.0.3
+openpyxl==3.1.5
+scikit-learn==1.9.0
+rich==15.0.0

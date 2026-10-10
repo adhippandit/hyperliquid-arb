@@ -90,14 +90,18 @@ def open_tickers() -> set:
 
 
 def open_positions() -> list:
-    """Full details of open trades, for live stop-loss monitoring."""
+    """Full details of open trades, for live stop-loss/close/timeout monitoring."""
     con = _connect()
     rows = con.execute(
-        "SELECT ticker, direction, position_usd, entry_gap_pct FROM trades WHERE status = 'open'"
+        "SELECT id, ticker, direction, position_usd, entry_gap_pct, entry_time FROM trades WHERE status = 'open'"
     ).fetchall()
     con.close()
     return [
-        {"ticker": r[0], "direction": r[1], "position_usd": r[2], "entry_gap_pct": r[3]}
+        {
+            "id": r[0], "ticker": r[1], "direction": r[2], "position_usd": r[3],
+            "entry_gap_pct": r[4],
+            "entry_time": datetime.strptime(r[5], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+        }
         for r in rows
     ]
 

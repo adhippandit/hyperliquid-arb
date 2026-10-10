@@ -11,20 +11,12 @@ import threading
 import http.server
 from market_hours import is_market_open, hours_to_market_open
 from risk import position_size, daily_loss_limit, vix_allowed, MAX_OPEN_TRADES, TOTAL_CAPITAL, VIX_CIRCUIT_BREAKER, MIN_CONFIDENCE, STOP_LOSS_MULTIPLIER
+from events import TICKERS, SIGNAL_THRESHOLD, CLOSE_THRESHOLD, HORIZON_HOURS, ticker_close_rates
 import trade_log
 
 MODEL_FILE  = "model.pkl"
 HTML_FILE   = "scorer.html"
 SERVER_PORT = 8765
-
-TICKERS = [
-    "NVDA", "TSLA", "AAPL", "AMZN", "MSFT",
-    "GOOGL", "META", "NFLX", "AMD", "INTC",
-    "COIN", "MSTR", "PLTR", "ARM", "TSM",
-    "GME", "BB", "NOK", "HOOD", "ZM",
-    "BABA", "MU", "QCOM", "AVGO", "ORCL",
-    "NOW", "RIVN",
-]
 
 def fetch_vix():
     """
@@ -114,7 +106,43 @@ def check_stop_losses(real_prices, hl_prices):
             })
     return alerts
 
-def score_gaps(model):
+def check_exits(real_prices, hl_prices):
+    """
+    Mirrors the exit rule events.py uses to label historical trades (see its
+    WIN/STOPPED_OUT/TIMEOUT logic) so live exits are judged the same way the
+    model was trained and backtested: gap closed, stop-loss hit, or held
+    past HORIZON_HOURS — whichever comes first.
+    """
+    exits = []
+    now = datetime.now(timezone.utc)
+    for pos in trade_log.open_positions():
+        ticker = pos["ticker"]
+        real   = real_prices.get(ticker)
+        hl_mid = hl_prices.get(ticker, {}).get("mid")
+        if not real or not hl_mid:
+            continue
+
+        current_gap_pct = (hl_mid - real) / real * 100
+        current_gap_abs = abs(current_gap_pct)
+        stop_level  = abs(pos["entry_gap_pct"]) * STOP_LOSS_MULTIPLIER
+        hours_open  = (now - pos["entry_time"]).total_seconds() / 3600
+
+        if current_gap_abs < CLOSE_THRESHOLD:
+            reason = "WIN"
+        elif current_gap_abs >= stop_level:
+            reason = "STOPPED_OUT"
+        elif hours_open >= HORIZON_HOURS:
+            reason = "TIMEOUT"
+        else:
+            continue
+
+        exits.append({
+            "ticker": ticker, "direction": pos["direction"],
+            "exit_gap_pct": current_gap_pct, "reason": reason,
+        })
+    return exits
+
+def score_gaps(model, ticker_rates):
     now         = datetime.now(timezone.utc)
     market_open = is_market_open()
     h_to_open   = hours_to_market_open()
@@ -147,7 +175,7 @@ def score_gaps(model):
         gap_pct = (gap / real) * 100
         gap_abs = abs(gap_pct)
 
-        if gap_abs < 0.5:
+        if gap_abs < SIGNAL_THRESHOLD:
             continue
 
         spread = hl.get("bid_ask_spread_pct", 0.1)
@@ -163,6 +191,8 @@ def score_gaps(model):
                 "hours_to_open":      h_to_open,
                 "vix":                vix,
                 "bid_ask_spread_pct": spread,
+                "ticker_close_rate":  ticker_rates.get(ticker, 0.5),
+                "funding_rate":       funding_rates.get(ticker, 0.0),
             }])
             confidence = model.predict_proba(features)[0][1]
 
@@ -195,7 +225,8 @@ def score_gaps(model):
         })
 
     results.sort(key=lambda x: x["confidence"], reverse=True)
-    return results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts
+    return (results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit,
+            stop_alerts, real_prices, hl_prices)
 
 def write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts):
     sg_time = datetime.now(ZoneInfo("Asia/Singapore"))
@@ -408,6 +439,10 @@ def main():
         model = pickle.load(f)
     print("Model ready.", flush=True)
 
+    print("Computing each ticker's historical closing rate...", flush=True)
+    ticker_rates = ticker_close_rates()
+    print(f"  Done — {len(ticker_rates)} tickers.", flush=True)
+
     t = threading.Thread(target=start_server, daemon=True)
     t.start()
     print(f"Serving on http://localhost:{SERVER_PORT}/{HTML_FILE}", flush=True)
@@ -416,7 +451,8 @@ def main():
     while True:
         try:
             print(f"[{datetime.now().strftime('%H:%M:%S')}]  Fetching prices...", flush=True)
-            results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts = score_gaps(model)
+            (results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit,
+             stop_alerts, _real_prices, _hl_prices) = score_gaps(model, ticker_rates)
             write_html(results, vix, vix_ok, h_to_open, market_open, now, todays_pnl, loss_limit_hit, stop_alerts)
 
             trades = [r for r in results if r["trade"]]

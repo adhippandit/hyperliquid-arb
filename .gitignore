@@ -1,3 +1,6 @@
+# Wallet credentials — never commit, even for testnet
+hyperliquid_testnet_config.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -224,3 +227,15 @@ gap_log_formatted.xlsx
 model.pkl
 backtest_results.xlsx
 scorer.html
+
+# One-off external data shares — not project code, not version controlled
+for_quant_review/
+
+# Auto-start logger output (unbounded runtime log, not project code)
+logger_output.log
+
+# Local-only data/model snapshots and shortcut backups — keep out of the public repo
+gap_log-*.db
+model_pre_*.pkl
+backtest_results_*.csv
+*.lnk.bak

@@ -4,7 +4,7 @@ import pickle
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from risk import MIN_CONFIDENCE, MAX_OPEN_TRADES, position_size
+from risk import MIN_CONFIDENCE, MAX_OPEN_TRADES, position_size, TAKER_FEE_PCT
 from events import load_data, build_features, build_events, time_split, FEATURES, DB_FILE
 
 MODEL_FILE = "model.pkl"
@@ -69,11 +69,13 @@ def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
         pos_size    = position_size(row["confidence"])  # real 5-10% confidence-scaled sizing, not a flat amount
         gap_captured = row["gap_abs"] - row["exit_gap_abs"]
         spread_cost  = spread * pos_size / 100
+        # Round trip: taker fee charged on both the entry and the exit order.
+        exchange_fee = TAKER_FEE_PCT * 2 * pos_size / 100
         funding      = (
             funding_income(con, row["ticker"], direction, row["timestamp"], row["exit_time"], pos_size)
             if has_funding_table else 0.0
         )
-        pnl          = round((gap_captured / 100) * pos_size - spread_cost + funding, 4)
+        pnl          = round((gap_captured / 100) * pos_size - spread_cost - exchange_fee + funding, 4)
         hours_held   = round((row["exit_time"] - row["timestamp"]).total_seconds() / 3600, 1)
 
         trades.append({
@@ -86,6 +88,7 @@ def run_backtest(test_events: pd.DataFrame, model) -> pd.DataFrame:
             "spread_pct":    round(spread, 4),
             "confidence":    f"{row['confidence']*100:.1f}%",
             "position_usd":  round(pos_size, 2),
+            "exchange_fee_usd": round(exchange_fee, 4),
             "funding_usd":   round(funding, 4),
             "hours_held":    hours_held,
             "outcome":       row["outcome"],
